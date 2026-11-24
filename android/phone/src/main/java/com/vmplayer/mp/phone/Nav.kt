@@ -1,0 +1,155 @@
+package com.vmplayer.mp.phone
+
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import com.vmplayer.mp.data.AccountSync
+import com.vmplayer.mp.data.Feed
+import com.vmplayer.mp.data.appScope
+import com.vmplayer.mp.data.videoFeed
+import com.vmplayer.mp.net.Account
+import com.vmplayer.mp.net.Actress
+import com.vmplayer.mp.net.ActressLookup
+import com.vmplayer.mp.net.BlockedException
+import com.vmplayer.mp.net.Detail
+import com.vmplayer.mp.net.Site
+import com.vmplayer.mp.net.Store
+import com.vmplayer.mp.net.Video
+import com.vmplayer.mp.net.WikiActress
+import kotlinx.coroutines.launch
+
+sealed class Route {
+    abstract val key: String
+
+    data object Main : Route() {
+        override val key = "main"
+    }
+
+    /** 分類／搜尋／女優／類型的影片列表，可以切換排序 */
+    class Listing(val title: String, val url: String) : Route() {
+        override val key = "list:$url"
+        var sort by mutableStateOf("")
+        /** 女優頁才有：單人／多人（網站端），有碼／無碼（App 端），跟排序各自獨立 */
+        var cast by mutableStateOf("")
+        var censor by mutableStateOf(Site.Censor.All)
+        val isActress = Site.isActressUrl(url)
+        private val feeds = HashMap<String, Feed<Video>>()
+        val feed: Feed<Video> get() = feeds.getOrPut("$sort|$cast") { videoFeed(url, sort, cast) }
+    }
+
+    class VideoPage(val preview: Video) : Route() {
+        override val key = "video:${preview.code}"
+        var detail by mutableStateOf<Detail?>(null)
+        var error by mutableStateOf<String?>(null)
+        var blocked by mutableStateOf(false)
+        /** 登入時：這部在帳號收藏裡嗎（null = 還不知道） */
+        var remoteSaved by mutableStateOf<Boolean?>(null)
+        var savingFav by mutableStateOf(false)
+        var favError by mutableStateOf<String?>(null)
+
+        /** 用番號查到的女優（null = 還在查） */
+        var wiki by mutableStateOf<List<WikiActress>?>(null)
+        var wikiError by mutableStateOf(false)
+
+        private fun lookupActress() {
+            if (wiki != null) return
+            wikiError = false
+            appScope.launch {
+                try {
+                    wiki = ActressLookup.find(preview.code)
+                } catch (e: Exception) {
+                    wikiError = true
+                }
+            }
+        }
+
+        fun load() {
+            error = null
+            blocked = false
+            lookupActress()
+            appScope.launch {
+                try {
+                    val d = Site.detail(preview.code)
+                    detail = d
+                    // 跟網站一樣：登入時打開影片頁會記進帳號的觀看記錄，同時拿收藏狀態
+                    val itemId = d.itemId
+                    if (Account.loggedIn && itemId != null) {
+                        remoteSaved = runCatching { Site.itemView(itemId) }.getOrNull()
+                        AccountSync.invalidateHistory()
+                    }
+                } catch (e: BlockedException) {
+                    blocked = true
+                    error = e.message
+                } catch (e: Exception) {
+                    error = e.message ?: e.toString()
+                }
+            }
+        }
+
+        /** 收藏／取消：登入時改帳號的，沒登入改本機的 */
+        fun toggleFavorite(video: Video) {
+            val id = detail?.itemId
+            if (!Account.loggedIn || id == null) {
+                Store.toggleFavorite(video)
+                return
+            }
+            if (savingFav) return
+            val target = remoteSaved != true
+            savingFav = true
+            favError = null
+            remoteSaved = target
+            appScope.launch {
+                try {
+                    Site.setSaved(id, target)
+                    AccountSync.invalidateSaved()
+                } catch (e: Exception) {
+                    remoteSaved = !target
+                    favError = e.message
+                } finally {
+                    savingFav = false
+                }
+            }
+        }
+    }
+
+    class Player(val video: Video, val playlist: String) : Route() {
+        override val key = "player:${video.code}"
+    }
+
+    data object Verify : Route() {
+        override val key = "verify"
+    }
+}
+
+object Nav {
+    val stack = mutableStateListOf<Route>(Route.Main)
+    val top: Route get() = stack.last()
+
+    fun push(r: Route) {
+        stack.add(r)
+    }
+
+    fun pop() {
+        if (stack.size > 1) stack.removeAt(stack.lastIndex)
+    }
+}
+
+/** 主畫面各分頁的狀態 */
+object MainState {
+    var tab by mutableIntStateOf(0)
+    var category by mutableIntStateOf(0)
+    var sort by mutableStateOf("")
+    private val feeds = HashMap<String, Feed<Video>>()
+
+    val feed: Feed<Video>
+        get() {
+            val path = Site.categories[category].path
+            return feeds.getOrPut("$path|$sort") { videoFeed(path, sort) }
+        }
+
+    val actresses = Feed<Actress>({ it.url }) { Site.actresses(it) }
+
+    var libraryTab by mutableIntStateOf(0)
+}

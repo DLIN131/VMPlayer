@@ -1,0 +1,251 @@
+package com.vmplayer.mp.net
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
+import java.net.URLEncoder
+
+data class Video(
+    /** 番號，也是網址路徑，例如 abc-123 */
+    val code: String,
+    val title: String,
+    val cover: String,
+    val duration: String = "",
+)
+
+data class Link(val name: String, val url: String)
+
+data class InfoRow(val label: String, val text: String, val links: List<Link>)
+
+data class Detail(
+    val video: Video,
+    val cover: String,
+    val rows: List<InfoRow>,
+    /** HLS 主播放清單 */
+    val playlist: String?,
+    /** 網站內部的影片編號，收藏／觀看記錄的 API 用 */
+    val itemId: String? = null,
+)
+
+data class Page<T>(val items: List<T>, val hasMore: Boolean)
+
+data class Actress(val name: String, val url: String, val avatar: String, val info: String)
+
+data class Category(val name: String, val path: String)
+
+/** 網站沒有 API，全部從 HTML 解析；網站改版時要改的就是這個檔案 */
+object Site {
+    val categories = listOf(
+        Category("最近更新", "/dm539/new"),
+        Category("新作上市", "/dm635/release"),
+        Category("中文字幕", "/dm278/chinese-subtitle"),
+        Category("今日熱門", "/dm301/today-hot"),
+        Category("本週熱門", "/dm170/weekly-hot"),
+        Category("本月熱門", "/dm273/monthly-hot"),
+        Category("無碼流出", "/dm817/uncensored-leak"),
+        Category("VR", "/genres/VR"),
+        Category("SIRO", "/dm36/siro"),
+        Category("LUXU", "/dm34/luxu"),
+        Category("GANA", "/dm34/gana"),
+        Category("PRESTIGE", "/dm1004/maan"),
+        Category("FC2", "/dm597/fc2"),
+        Category("HEYZO", "/dm2208642/heyzo"),
+        Category("東京熱", "/dm42/tokyohot"),
+        Category("一本道", "/dm4551174/1pondo"),
+        Category("Caribbeancom", "/dm6840521/caribbeancom"),
+        Category("10musume", "/dm6238682/10musume"),
+        Category("麻豆", "/dm63/madou"),
+    )
+
+    /** 排序：網址參數 to 顯示名稱，"" 是網站預設 */
+    val sorts = listOf(
+        "" to "預設",
+        "released_at" to "發行日期",
+        "published_at" to "最近更新",
+        "saved" to "收藏數",
+        "today_views" to "今日瀏覽",
+        "weekly_views" to "本週瀏覽",
+        "monthly_views" to "本月瀏覽",
+        "views" to "總瀏覽數",
+    )
+
+    private fun enc(s: String) = URLEncoder.encode(s, "UTF-8").replace("+", "%20")
+
+    fun abs(path: String) = if (path.startsWith("http")) path else WebFetcher.BASE + path
+
+    fun searchUrl(query: String) = abs("/search/${enc(query.trim())}")
+
+    private suspend fun doc(url: String): Document {
+        val html = WebFetcher.get(url)
+        return withContext(Dispatchers.Default) { Jsoup.parse(html, WebFetcher.BASE) }
+    }
+
+    /** 女優頁的演出人數篩選：網址參數 to 顯示名稱（網站端篩選） */
+    val casts = listOf(
+        "" to "全部",
+        "individual" to "單人作品",
+        "multiple" to "多人作品",
+    )
+
+    /** 有碼／無碼篩選。網站沒有這個參數，無碼片的番號都帶 -uncensored，所以在 App 端過濾 */
+    enum class Censor(val label: String) {
+        All("全部"),
+        Censored("有碼"),
+        Uncensored("無碼");
+
+        fun accept(v: Video) = when (this) {
+            All -> true
+            Censored -> !isUncensored(v)
+            Uncensored -> isUncensored(v)
+        }
+    }
+
+    fun isUncensored(v: Video) = v.code.contains("uncensored")
+
+    fun isActressUrl(url: String) = url.contains("/actresses/")
+
+    private fun withParams(url: String, page: Int, sort: String, filters: String = ""): String {
+        val params = buildList {
+            if (filters.isNotEmpty()) add("filters=$filters")
+            if (sort.isNotEmpty()) add("sort=$sort")
+            if (page > 1) add("page=$page")
+        }
+        if (params.isEmpty()) return url
+        return url + (if (url.contains('?')) "&" else "?") + params.joinToString("&")
+    }
+
+    /** 分類／搜尋／女優／類型頁；filters 是女優頁的單人／多人篩選 */
+    suspend fun list(url: String, page: Int, sort: String = "", filters: String = ""): Page<Video> {
+        val d = doc(withParams(abs(url), page, sort, filters))
+        val items = parseCards(d)
+        val hasMore = items.isNotEmpty() && d.select("a[href*=page=${page + 1}]").isNotEmpty()
+        return Page(items, hasMore)
+    }
+
+    // ---------- 帳號（要登入） ----------
+
+    /** 帳號的影片收藏／觀看記錄（path = /saved 或 /history），新的在前面 */
+    suspend fun accountList(path: String, page: Int): Page<Video> {
+        val html = WebFetcher.get(withParams(abs(path), page, ""))
+        Account.update(html)
+        if (!Account.loggedIn) throw NotLoggedInException()
+        return withContext(Dispatchers.Default) {
+            val d = Jsoup.parse(html, WebFetcher.BASE)
+            val items = parseCards(d)
+            Page(items, items.isNotEmpty() && d.select("a[href*=page=${page + 1}]").isNotEmpty())
+        }
+    }
+
+    /**
+     * 打開影片頁時通知網站（跟網站一樣，會記一筆觀看記錄），順便拿這部有沒有收藏。
+     * 沒登入回傳 null。
+     */
+    suspend fun itemView(itemId: String): Boolean? {
+        val (status, text) = WebFetcher.api("GET", "/api/items/$itemId/view")
+        if (status !in 200..299) return null
+        val o = runCatching { org.json.JSONObject(text) }.getOrNull() ?: return null
+        if (o.isNull("user")) {
+            Account.markExpired()
+            return null
+        }
+        return o.optBoolean("saved")
+    }
+
+    /** 加入／移除帳號收藏 */
+    suspend fun setSaved(itemId: String, saved: Boolean) {
+        val (status, _) = WebFetcher.api(if (saved) "POST" else "DELETE", "/api/items/$itemId/save", "{}")
+        if (status == 401) {
+            Account.markExpired()
+            throw NotLoggedInException()
+        }
+        if (status !in 200..299) throw Exception("網站回應 HTTP $status")
+    }
+
+    /** 清除帳號的所有觀看記錄 */
+    suspend fun clearHistory() {
+        val (status, _) = WebFetcher.api("DELETE", "/api/history", "{}")
+        if (status == 401) {
+            Account.markExpired()
+            throw NotLoggedInException()
+        }
+        if (status !in 200..299) throw Exception("網站回應 HTTP $status")
+    }
+
+    private fun parseCards(d: Document): List<Video> {
+        val out = LinkedHashMap<String, Video>()
+        for (card in d.select("div.thumbnail")) {
+            val a = card.selectFirst("a[href]") ?: continue
+            val code = a.absUrl("href").substringAfterLast('/').substringBefore('?').substringBefore('#')
+            if (code.isEmpty() || code in out) continue
+            val img = card.selectFirst("img")
+            val cover = img?.absUrl("data-src")?.ifEmpty { null } ?: img?.absUrl("src").orEmpty()
+            val title = card.selectFirst("div.my-2 a")?.text()?.trim()
+                ?: img?.attr("alt")?.trim().orEmpty()
+            val duration = card.selectFirst("span.absolute")?.text()?.trim().orEmpty()
+            out[code] = Video(code, title, cover, duration)
+        }
+        return out.values.toList()
+    }
+
+    suspend fun detail(code: String): Detail {
+        val html = WebFetcher.get("/$code")
+        return withContext(Dispatchers.Default) {
+            val d = Jsoup.parse(html, WebFetcher.BASE)
+            val rows = d.select("div.space-y-2 > div").mapNotNull { div ->
+                val text = div.text().trim()
+                val label = text.substringBefore(':', "").trim()
+                if (label.isEmpty() || label.length > 8) return@mapNotNull null
+                val links = div.select("a[href]").map { Link(it.text().trim(), it.absUrl("href")) }
+                    .filter { it.name.isNotEmpty() }
+                InfoRow(label, text.substringAfter(':').trim(), links)
+            }.distinctBy { it.label }
+            val cover = d.selectFirst("meta[property=og:image]")?.attr("content").orEmpty()
+            val title = d.selectFirst("h1")?.text()?.trim().orEmpty()
+            Detail(
+                video = Video(code, title, cover.replace("cover-n.jpg", "cover-t.jpg")),
+                cover = cover,
+                rows = rows,
+                playlist = findPlaylist(html),
+                itemId = Regex("/api/items/([A-Za-z0-9]+)/(?:save|view)").find(html)?.groupValues?.get(1),
+            )
+        }
+    }
+
+    /** 播放網址藏在 p,a,c,k,e,d 打包過的 JS 裡，先解開再找 m3u8 */
+    internal fun findPlaylist(html: String): String? {
+        val m3u8 = Regex("https?://[^'\"\\s]+?\\.m3u8")
+        val packed = Regex(
+            """eval\(function\(p,a,c,k,e,d\)\{.*?\}\('(.*?)',(\d+),(\d+),'(.*?)'\.split\('\|'\)""",
+            RegexOption.DOT_MATCHES_ALL,
+        )
+        for (m in packed.findAll(html)) {
+            val (p, a, _, k) = m.destructured
+            val words = k.split('|')
+            val radix = a.toInt().coerceIn(2, 36)
+            val code = Regex("\\b\\w+\\b").replace(p.replace("\\'", "'")) { w ->
+                val i = w.value.toIntOrNull(radix)
+                if (i != null && i < words.size && words[i].isNotEmpty()) words[i] else w.value
+            }
+            val all = m3u8.findAll(code).map { it.value }.toList()
+            (all.firstOrNull { it.endsWith("playlist.m3u8") } ?: all.firstOrNull())?.let { return it }
+        }
+        return m3u8.find(html)?.value
+    }
+
+    suspend fun actresses(page: Int): Page<Actress> {
+        val d = doc(withParams(abs("/actresses"), page, ""))
+        val items = d.select("li").mapNotNull { li ->
+            val name = li.selectFirst("h4")?.text()?.trim() ?: return@mapNotNull null
+            val a = li.selectFirst("a[href]") ?: return@mapNotNull null
+            Actress(
+                name = name,
+                url = a.absUrl("href"),
+                avatar = li.selectFirst("img")?.absUrl("src").orEmpty(),
+                info = li.select("p").joinToString(" · ") { it.text().trim() },
+            )
+        }
+        val hasMore = items.isNotEmpty() && d.select("a[href*=page=${page + 1}]").isNotEmpty()
+        return Page(items, hasMore)
+    }
+}

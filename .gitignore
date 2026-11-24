@@ -1,0 +1,17 @@
+# Android
+.gradle/
+.kotlin/
+build/
+local.properties
+.idea/
+*.iml
+keystore/
+*.jks
+*.apk
+android/build-log.txt
+
+# 桌面版
+node_modules/
+desktop/dist/
+desktop/out/
+desktop/downloads/
