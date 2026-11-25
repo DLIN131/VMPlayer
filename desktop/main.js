@@ -88,6 +88,9 @@ function createWindow() {
     const maximized = win.isMaximized()
     settings.set('bounds', { ...(maximized ? settings.get('bounds') : win.getNormalBounds()), maximized })
   })
+  // 主視窗關掉就結束程式。網站驗證用的隱藏視窗還在的話不會觸發 window-all-closed，
+  // 程式會留在背景，再開一次時被「只能開一份」擋住，看起來就是開不起來
+  win.on('closed', () => app.quit())
 }
 
 function setupIpc() {
@@ -192,7 +195,11 @@ if (!app.requestSingleInstanceLock()) {
 } else {
   removeOldCaches()
   app.on('second-instance', () => {
-    if (!win || win.isDestroyed()) return
+    if (!win || win.isDestroyed()) {
+      // 主視窗已經關掉（程式正在結束或卡在背景）：重新開一個
+      if (app.isReady() && !app.isQuitting) createWindow()
+      return
+    }
     if (win.isMinimized()) win.restore()
     win.show()
     win.focus()
